@@ -1,0 +1,1 @@
+R1 5 bug：Web Worker+Comlink 没实现；missedRemindersStore 无 consumer；snooze 不循环重弹；Page Visibility API 标签页回来补弹缺失；snooze 跨天不重算 fixedTime。
