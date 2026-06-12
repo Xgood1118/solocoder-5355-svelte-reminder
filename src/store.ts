@@ -142,12 +142,20 @@ function createRemindersStore() {
         const updated = reminders.map(r => {
           if (r.id === id) {
             const newStatus = r.status === 'active' ? 'paused' : 'active';
-            const merged = { ...r, status: newStatus, updatedAt: formatDate(new Date()) } as Reminder;
+            const now = new Date();
+            const merged = { ...r, status: newStatus, updatedAt: formatDate(now) } as Reminder;
 
             if (newStatus === 'active') {
-              const nextRun = calculateNextRun(merged);
-              if (nextRun) {
-                merged.nextRunAt = formatDate(nextRun);
+              if (r.repeatStrategy === 'once') {
+                const currentNextRun = new Date(r.nextRunAt);
+                if (currentNextRun > now) {
+                  merged.nextRunAt = r.nextRunAt;
+                }
+              } else {
+                const nextRun = calculateNextRun(merged, now);
+                if (nextRun) {
+                  merged.nextRunAt = formatDate(nextRun);
+                }
               }
             }
 
@@ -190,6 +198,57 @@ function createRemindersStore() {
       });
     },
 
+    markMissed(id: string) {
+      update(reminders => {
+        const updated = reminders.map(r => {
+          if (r.id !== id) return r;
+          const now = new Date();
+          return {
+            ...r,
+            lastRunAt: formatDate(now),
+            updatedAt: formatDate(now)
+          } as Reminder;
+        });
+        persist(updated);
+        return updated;
+      });
+    },
+
+    forceRecalculateNextRun(id: string) {
+      update(reminders => {
+        const updated = reminders.map(r => {
+          if (r.id !== id) return r;
+          const now = new Date();
+          const nextRun = calculateNextRun(r, now);
+          if (nextRun) {
+            return {
+              ...r,
+              nextRunAt: formatDate(nextRun),
+              updatedAt: formatDate(now)
+            } as Reminder;
+          }
+          return { ...r, updatedAt: formatDate(now) } as Reminder;
+        });
+        persist(updated);
+        return updated;
+      });
+    },
+
+    updateNextRun(id: string, nextRunAt: string) {
+      update(reminders => {
+        const updated = reminders.map(r => {
+          if (r.id !== id) return r;
+          return {
+            ...r,
+            nextRunAt,
+            updatedAt: formatDate(new Date())
+          } as Reminder;
+        });
+        persist(updated);
+        return updated;
+      });
+    },
+
     snooze(id: string, minutes: number) {
       update(reminders => {
         const updated = reminders.map(r => {
@@ -213,9 +272,18 @@ function createRemindersStore() {
       update(reminders => {
         const updated = reminders.map(r => {
           if (r.status !== 'active') return r;
+
+          if (r.repeatStrategy === 'once') {
+            const currentNextRun = new Date(r.nextRunAt);
+            if (currentNextRun > now) {
+              return r;
+            }
+            return r;
+          }
+
           const nextRun = calculateNextRun(r, now);
           if (nextRun) {
-            return { ...r, nextRunAt: formatDate(nextRun) } as Reminder;
+            return { ...r, nextRunAt: formatDate(nextRun), updatedAt: formatDate(now) } as Reminder;
           }
           return r;
         });

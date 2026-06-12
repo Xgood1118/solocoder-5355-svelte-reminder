@@ -5,8 +5,8 @@
   import Settings from './pages/Settings.svelte';
   import ReminderModal from './components/ReminderModal.svelte';
   import { remindersStore, settingsStore } from './store';
-  import { isInDndPeriod, getNextDndEndTime } from './utils';
   import type { Reminder, MissedReminder } from './types';
+  import type { WorkerToMainMessage, WorkerReminderSnapshot, WorkerSettingsSnapshot } from './workers/reminder.worker';
 
   type Page = 'home' | 'settings';
 
@@ -14,23 +14,22 @@
   let activeModal: Reminder | null = null;
   let missedReminders: MissedReminder[] = [];
   let showMissedModal = false;
+
   let tickInterval: number | null = null;
   let lastVisibilityCheck = new Date();
 
-  $: sortedReminders = [...$remindersStore]
-    .filter(r => r.status === 'active')
-    .sort((a, b) => new Date(a.nextRunAt).getTime() - new Date(b.nextRunAt).getTime());
+  let reminderWorker: Worker | null = null;
+  const pendingTriggerQueue: Array<{ reminderId: string; triggeredAt: string }> = [];
+  let isProcessingTrigger = false;
 
   function applyTheme() {
     const theme = $settingsStore.theme;
     let effectiveTheme: 'light' | 'dark';
-
     if (theme === 'auto') {
       effectiveTheme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
     } else {
       effectiveTheme = theme;
     }
-
     document.documentElement.setAttribute('data-theme', effectiveTheme);
   }
 
@@ -41,100 +40,50 @@
 
   function handlePopState() {
     const hash = window.location.hash.replace('#', '');
-    if (hash === 'settings') {
-      currentPage = 'settings';
-    } else {
-      currentPage = 'home';
-    }
+    currentPage = hash === 'settings' ? 'settings' : 'home';
   }
 
-  function checkReminders() {
-    const now = new Date();
-
-    if (isInDndPeriod(now, $settingsStore.dndPeriods)) {
-      for (const reminder of sortedReminders) {
-        const nextRun = new Date(reminder.nextRunAt);
-        if (nextRun <= now && reminder.status === 'active') {
-          const alreadyMissed = missedReminders.some(m => m.reminder.id === reminder.id);
-          if (!alreadyMissed) {
-            missedReminders = [...missedReminders, {
-              reminder: { ...reminder },
-              missedAt: now.toISOString()
-            }];
-          }
-          remindersStore.markTriggered(reminder.id);
-        }
-      }
-      return;
-    }
-
-    if (missedReminders.length > 0) {
-      showMissedModal = true;
-      return;
-    }
-
-    for (const reminder of sortedReminders) {
-      const nextRun = new Date(reminder.nextRunAt);
-      if (nextRun <= now && reminder.status === 'active') {
-        triggerReminder(reminder);
-        break;
-      }
-    }
+  function syncRemindersToWorker() {
+    if (!reminderWorker) return;
+    const snapshot: WorkerReminderSnapshot[] = $remindersStore.map(r => ({
+      id: r.id,
+      nextRunAt: r.nextRunAt,
+      status: r.status,
+      repeatStrategy: r.repeatStrategy,
+      cronExpr: r.cronExpr,
+      intervalMin: r.intervalMin,
+      fixedTime: r.fixedTime,
+      weeklyDays: r.weeklyDays,
+      lastRunAt: r.lastRunAt
+    }));
+    reminderWorker.postMessage({ type: 'SET_REMINDERS', reminders: snapshot });
   }
 
-  function triggerReminder(reminder: Reminder) {
-    activeModal = reminder;
-    remindersStore.markTriggered(reminder.id);
+  function syncSettingsToWorker() {
+    if (!reminderWorker) return;
+    const snapshot: WorkerSettingsSnapshot = {
+      dndPeriods: $settingsStore.dndPeriods
+    };
+    reminderWorker.postMessage({ type: 'SET_SETTINGS', settings: snapshot });
+  }
 
-    if ($settingsStore.desktopNotifications && 'Notification' in window && Notification.permission === 'granted') {
-      try {
-        const notification = new Notification(reminder.title, {
-          body: reminder.content || '提醒时间到',
-          tag: reminder.id,
-          requireInteraction: true,
-          silent: !reminder.soundEnabled || !$settingsStore.soundEnabled
-        });
-
-        notification.onclick = () => {
-          window.focus();
-          notification.close();
-        };
-      } catch (e) {
-        console.warn('Desktop notification failed, falling back to modal:', e);
-      }
-    }
-
-    if (reminder.soundEnabled && $settingsStore.soundEnabled) {
-      playNotificationSound();
-    }
-
-    const duration = $settingsStore.defaultModalDuration;
-    if (duration > 0 && reminder.repeatStrategy !== 'interval') {
-      setTimeout(() => {
-        if (activeModal?.id === reminder.id) {
-          closeModal();
-        }
-      }, duration * 1000);
-    }
+  function findReminderById(id: string): Reminder | undefined {
+    return $remindersStore.find(r => r.id === id);
   }
 
   function playNotificationSound() {
     try {
       const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
-      const oscillator = audioCtx.createOscillator();
-      const gainNode = audioCtx.createGain();
-
-      oscillator.connect(gainNode);
-      gainNode.connect(audioCtx.destination);
-
-      oscillator.frequency.value = 880;
-      oscillator.type = 'sine';
-
-      gainNode.gain.setValueAtTime(0.3, audioCtx.currentTime);
-      gainNode.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.5);
-
-      oscillator.start(audioCtx.currentTime);
-      oscillator.stop(audioCtx.currentTime + 0.5);
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.connect(gain);
+      gain.connect(audioCtx.destination);
+      osc.frequency.value = 880;
+      osc.type = 'sine';
+      gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.5);
+      osc.start(audioCtx.currentTime);
+      osc.stop(audioCtx.currentTime + 0.5);
 
       setTimeout(() => {
         const osc2 = audioCtx.createOscillator();
@@ -150,6 +99,125 @@
       }, 600);
     } catch (e) {
       console.warn('Failed to play notification sound:', e);
+    }
+  }
+
+  function fireDesktopNotification(reminder: Reminder) {
+    if (!($settingsStore.desktopNotifications && 'Notification' in window && Notification.permission === 'granted')) return;
+    try {
+      const notification = new Notification(reminder.title, {
+        body: reminder.content || '提醒时间到',
+        tag: reminder.id,
+        requireInteraction: true,
+        silent: !reminder.soundEnabled || !$settingsStore.soundEnabled
+      });
+      notification.onclick = () => {
+        window.focus();
+        notification.close();
+      };
+    } catch (e) {
+      console.warn('Desktop notification failed:', e);
+    }
+  }
+
+  function triggerReminderModal(reminder: Reminder) {
+    activeModal = reminder;
+    remindersStore.markTriggered(reminder.id);
+
+    fireDesktopNotification(reminder);
+    if (reminder.soundEnabled && $settingsStore.soundEnabled) {
+      playNotificationSound();
+    }
+
+    const duration = $settingsStore.defaultModalDuration;
+    if (duration > 0 && reminder.repeatStrategy !== 'interval') {
+      setTimeout(() => {
+        if (activeModal?.id === reminder.id) closeModal();
+      }, duration * 1000);
+    }
+  }
+
+  async function processTriggerQueue() {
+    if (isProcessingTrigger) return;
+    isProcessingTrigger = true;
+
+    try {
+      while (pendingTriggerQueue.length > 0) {
+        if (activeModal) {
+          await new Promise<void>(resolve => {
+            const check = setInterval(() => {
+              if (!activeModal) {
+                clearInterval(check);
+                resolve();
+              }
+            }, 300);
+          });
+        }
+
+        const next = pendingTriggerQueue.shift();
+        if (!next) break;
+
+        const reminder = findReminderById(next.reminderId);
+        if (!reminder || reminder.status !== 'active') continue;
+
+        const nextRun = new Date(reminder.nextRunAt);
+        if (nextRun > new Date()) continue;
+
+        triggerReminderModal(reminder);
+
+        if (pendingTriggerQueue.length > 0) {
+          await new Promise(r => setTimeout(r, 200));
+        }
+      }
+    } finally {
+      isProcessingTrigger = false;
+    }
+  }
+
+  function handleWorkerMessage(e: MessageEvent<WorkerToMainMessage>) {
+    const msg = e.data;
+
+    switch (msg.type) {
+      case 'TRIGGER_REMINDER': {
+        pendingTriggerQueue.push({ reminderId: msg.reminderId, triggeredAt: msg.triggeredAt });
+        processTriggerQueue();
+        break;
+      }
+      case 'MISSED_IN_DND': {
+        const reminder = findReminderById(msg.reminderId);
+        if (reminder) {
+          const alreadyMissed = missedReminders.some(m => m.reminder.id === msg.reminderId);
+          if (!alreadyMissed) {
+            missedReminders = [...missedReminders, {
+              reminder: { ...reminder },
+              missedAt: msg.missedAt
+            }];
+          }
+          remindersStore.markMissed(msg.reminderId);
+        }
+        break;
+      }
+      case 'NEXT_RUN_UPDATED': {
+        remindersStore.updateNextRun(msg.reminderId, msg.nextRunAt);
+        break;
+      }
+      case 'DND_ENDED': {
+        if (missedReminders.length > 0) {
+          showMissedModal = true;
+        } else {
+          const fromDND = msg.reminderIds
+            .map(id => findReminderById(id))
+            .filter((r): r is Reminder => !!r);
+          if (fromDND.length > 0) {
+            missedReminders = fromDND.map(r => ({
+              reminder: r,
+              missedAt: new Date().toISOString()
+            }));
+            showMissedModal = true;
+          }
+        }
+        break;
+      }
     }
   }
 
@@ -177,8 +245,13 @@
   }
 
   function handleMissedView() {
+    const missedIds = new Set(missedReminders.map(m => m.reminder.id));
     missedReminders = [];
     showMissedModal = false;
+    for (const id of missedIds) {
+      pendingTriggerQueue.push({ reminderId: id, triggeredAt: new Date().toISOString() });
+    }
+    processTriggerQueue();
     navigateTo('home');
   }
 
@@ -189,23 +262,53 @@
       const now = new Date();
       const elapsed = now.getTime() - lastVisibilityCheck.getTime();
 
-      if (elapsed > 60000) {
-        console.log(`Page was hidden for ${Math.round(elapsed / 1000)}s, recalculating reminders...`);
+      if (elapsed > 10000) {
+        console.log(`[Visibility] Page hidden ${Math.round(elapsed / 1000)}s, catching up...`);
+
         remindersStore.refreshAllNextRuns();
 
+        if (reminderWorker) {
+          reminderWorker.postMessage({ type: 'CLEAR_TRIGGER_CACHE' });
+          reminderWorker.postMessage({ type: 'FORCE_CHECK' });
+          reminderWorker.postMessage({ type: 'SYNC_TIME', clientNow: now.getTime() });
+          syncRemindersToWorker();
+        }
+
+        const catchUpNow = new Date();
+        const newlyMissed: MissedReminder[] = [];
+
         for (const reminder of $remindersStore) {
-          if (reminder.status === 'active') {
-            const nextRun = new Date(reminder.nextRunAt);
-            if (nextRun < now) {
-              const alreadyMissed = missedReminders.some(m => m.reminder.id === reminder.id);
-              if (!alreadyMissed) {
-                missedReminders = [...missedReminders, {
-                  reminder: { ...reminder },
-                  missedAt: nextRun.toISOString()
-                }];
-              }
+          if (reminder.status !== 'active') continue;
+
+          remindersStore.forceRecalculateNextRun(reminder.id);
+
+          const updated = findReminderById(reminder.id);
+          if (!updated) continue;
+
+          const nextRun = new Date(updated.nextRunAt);
+          if (nextRun < catchUpNow) {
+            newlyMissed.push({
+              reminder: { ...updated },
+              missedAt: nextRun.toISOString()
+            });
+          }
+        }
+
+        if (newlyMissed.length > 0) {
+          const existingIds = new Set(missedReminders.map(m => m.reminder.id));
+          for (const m of newlyMissed) {
+            if (!existingIds.has(m.reminder.id)) {
+              missedReminders = [...missedReminders, m];
             }
           }
+
+          for (const m of newlyMissed) {
+            pendingTriggerQueue.push({
+              reminderId: m.reminder.id,
+              triggeredAt: new Date().toISOString()
+            });
+          }
+          processTriggerQueue();
         }
       }
 
@@ -213,25 +316,48 @@
     }
   }
 
+  let unsubscribeReminders: (() => void) | null = null;
+  let unsubscribeSettings: (() => void) | null = null;
+
   onMount(() => {
     applyTheme();
 
+    try {
+      reminderWorker = new Worker(new URL('./workers/reminder.worker.ts', import.meta.url), {
+        type: 'module'
+      });
+      reminderWorker.addEventListener('message', handleWorkerMessage);
+      syncRemindersToWorker();
+      syncSettingsToWorker();
+    } catch (e) {
+      console.warn('Failed to init Web Worker, falling back to main thread timer:', e);
+    }
+
+    unsubscribeReminders = remindersStore.subscribe(() => {
+      syncRemindersToWorker();
+    });
+    unsubscribeSettings = settingsStore.subscribe(() => {
+      syncSettingsToWorker();
+      applyTheme();
+    });
+
     const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
     mediaQuery.addEventListener('change', applyTheme);
-
     window.addEventListener('popstate', handlePopState);
     document.addEventListener('visibilitychange', handleVisibilityChange);
 
     const hash = window.location.hash.replace('#', '');
-    if (hash === 'settings') {
-      currentPage = 'settings';
+    if (hash === 'settings') currentPage = 'settings';
+
+    if (!reminderWorker) {
+      tickInterval = window.setInterval(() => {
+        reminderWorker?.postMessage({ type: 'FORCE_CHECK' });
+      }, 1000);
     }
 
-    tickInterval = window.setInterval(() => {
-      checkReminders();
-    }, 1000);
-
-    setTimeout(checkReminders, 500);
+    setTimeout(() => {
+      reminderWorker?.postMessage({ type: 'FORCE_CHECK' });
+    }, 500);
 
     return () => {
       mediaQuery.removeEventListener('change', applyTheme);
@@ -239,11 +365,12 @@
   });
 
   onDestroy(() => {
-    if (tickInterval) {
-      clearInterval(tickInterval);
-    }
+    if (tickInterval) clearInterval(tickInterval);
     window.removeEventListener('popstate', handlePopState);
     document.removeEventListener('visibilitychange', handleVisibilityChange);
+    unsubscribeReminders?.();
+    unsubscribeSettings?.();
+    reminderWorker?.terminate();
   });
 
   $: if ($settingsStore.theme) {
@@ -277,7 +404,7 @@
           <polyline points="12 6 12 12 16 14"/>
         </svg>
       </div>
-      <h2 class="missed-title">免打扰期间有 {missedReminders.length} 条错过的提醒</h2>
+      <h2 class="missed-title">您有 {missedReminders.length} 条错过的提醒</h2>
       <div class="missed-list">
         {#each missedReminders.slice(0, 5) as missed}
           <div class="missed-item">
@@ -291,7 +418,7 @@
       </div>
       <div class="missed-actions">
         <button class="btn btn-secondary" on:click={handleMissedDismiss}>知道了</button>
-        <button class="btn btn-primary" on:click={handleMissedView}>查看全部</button>
+        <button class="btn btn-primary" on:click={handleMissedView}>逐个重弹</button>
       </div>
     </div>
   </div>
@@ -299,10 +426,8 @@
 
 <script lang="ts" context="module">
   function formatMissedTime(time: string): string {
-    const date = new Date(time);
-    const hours = String(date.getHours()).padStart(2, '0');
-    const minutes = String(date.getMinutes()).padStart(2, '0');
-    return `${hours}:${minutes}`;
+    const d = new Date(time);
+    return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
   }
 </script>
 
@@ -315,10 +440,7 @@
 
   .missed-modal-overlay {
     position: fixed;
-    top: 0;
-    left: 0;
-    right: 0;
-    bottom: 0;
+    inset: 0;
     background: rgba(0, 0, 0, 0.5);
     display: flex;
     align-items: center;
@@ -377,9 +499,7 @@
     font-size: 14px;
   }
 
-  .missed-item:last-child {
-    border-bottom: none;
-  }
+  .missed-item:last-child { border-bottom: none; }
 
   .missed-item-title {
     color: var(--text-primary);
@@ -400,7 +520,7 @@
   .missed-more {
     font-size: 13px;
     color: var(--text-tertiary);
-    margin: 8px 0 0 0;
+    margin: 8px 0 0;
     text-align: center;
   }
 
@@ -425,22 +545,16 @@
     color: white;
   }
 
-  .btn-primary:hover {
-    background: var(--accent-hover);
-  }
+  .btn-primary:hover { background: var(--accent-hover); }
 
   .btn-secondary {
     background: var(--bg-secondary);
     color: var(--text-primary);
   }
 
-  .btn-secondary:hover {
-    background: var(--bg-tertiary);
-  }
+  .btn-secondary:hover { background: var(--bg-tertiary); }
 
   @media (max-width: 480px) {
-    .missed-modal {
-      padding: 24px 20px;
-    }
+    .missed-modal { padding: 24px 20px; }
   }
 </style>
